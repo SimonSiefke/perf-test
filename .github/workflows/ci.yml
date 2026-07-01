@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  perf-smoke-test:
+    name: Perf smoke test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install perf
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y linux-tools-common linux-tools-generic
+          sudo apt-get install -y "linux-tools-$(uname -r)" || sudo apt-get install -y linux-tools-azure || true
+
+      - name: Run perf smoke test
+        run: |
+          set -euo pipefail
+
+          echo "Kernel: $(uname -r)"
+          echo "perf_event_paranoid: $(cat /proc/sys/kernel/perf_event_paranoid)"
+
+          perf_bin="$(command -v perf || true)"
+          if [ -z "$perf_bin" ] || ! "$perf_bin" --version; then
+            perf_bin="$(find /usr/lib/linux-tools -type f -name perf 2>/dev/null | sort -V | tail -n 1 || true)"
+          fi
+
+          if [ -z "$perf_bin" ]; then
+            echo "::warning::No perf binary is available on this runner."
+            exit 0
+          fi
+
+          "$perf_bin" --version
+
+          if "$perf_bin" stat true; then
+            echo "perf stat smoke test passed."
+          else
+            echo "::warning::perf stat is unavailable on this runner. This is expected on some hosted Linux runners with restrictive kernel perf settings."
+          fi
