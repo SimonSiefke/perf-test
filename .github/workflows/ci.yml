@@ -9,26 +9,32 @@ permissions:
   contents: read
 
 jobs:
-  perf-smoke-test:
-    name: Perf smoke test
+  performance-tools:
+    name: Performance tools
     runs-on: ubuntu-latest
 
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Install perf
+      - name: Install performance tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y linux-tools-common linux-tools-generic
+          sudo apt-get install -y linux-tools-common linux-tools-generic strace
           sudo apt-get install -y "linux-tools-$(uname -r)" || sudo apt-get install -y linux-tools-azure || true
 
-      - name: Run perf smoke test
+      - name: Enable perf events
         run: |
           set -euo pipefail
 
           echo "Kernel: $(uname -r)"
-          echo "perf_event_paranoid: $(cat /proc/sys/kernel/perf_event_paranoid)"
+          echo "Before: kernel.perf_event_paranoid=$(cat /proc/sys/kernel/perf_event_paranoid)"
+          sudo sysctl -w kernel.perf_event_paranoid=-1
+          echo "After: kernel.perf_event_paranoid=$(cat /proc/sys/kernel/perf_event_paranoid)"
+
+      - name: Run perf smoke test
+        run: |
+          set -euo pipefail
 
           perf_bin="$(command -v perf || true)"
           if [ -z "$perf_bin" ] || ! "$perf_bin" --version; then
@@ -42,8 +48,17 @@ jobs:
 
           "$perf_bin" --version
 
-          if "$perf_bin" stat true; then
-            echo "perf stat smoke test passed."
-          else
-            echo "::warning::perf stat is unavailable on this runner. This is expected on some hosted Linux runners with restrictive kernel perf settings."
-          fi
+          "$perf_bin" stat \
+            -e task-clock,context-switches,cpu-migrations,page-faults \
+            -o perf-stat.txt \
+            -- sleep 0.1
+
+          cat perf-stat.txt
+
+      - name: Run strace smoke test
+        run: |
+          set -euo pipefail
+
+          strace -qq -f -o strace.log -- sleep 0.1
+          test -s strace.log
+          head -n 20 strace.log
