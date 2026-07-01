@@ -20,7 +20,7 @@ jobs:
       - name: Install performance tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y linux-tools-common linux-tools-generic strace
+          sudo apt-get install -y linux-tools-common linux-tools-generic strace valgrind
           sudo apt-get install -y "linux-tools-$(uname -r)" || sudo apt-get install -y linux-tools-azure || true
 
       - name: Enable perf events
@@ -32,7 +32,7 @@ jobs:
           sudo sysctl -w kernel.perf_event_paranoid=-1
           echo "After: kernel.perf_event_paranoid=$(cat /proc/sys/kernel/perf_event_paranoid)"
 
-      - name: Run perf counter smoke test
+      - name: Run perf smoke test
         run: |
           set -euo pipefail
 
@@ -48,33 +48,29 @@ jobs:
 
           "$perf_bin" --version
 
-          workload=(
-            python3
-            -c
-            'total = sum((i % 97) * (i % 89) for i in range(1000000)); print(total)'
-          )
-
           "$perf_bin" stat \
             -x, \
-            -e cycles,instructions,task-clock,context-switches,cpu-migrations,page-faults \
+            -e task-clock,context-switches,cpu-migrations,page-faults \
             -o perf-stat.csv \
-            -- "${workload[@]}"
+            -- python3 -c 'total = sum((i % 97) * (i % 89) for i in range(1000000)); print(total)'
 
           cat perf-stat.csv
 
           awk -F, '
             BEGIN {
-              required["cycles"] = 1
-              required["instructions"] = 1
+              required["task-clock"] = 1
+              required["page-faults"] = 1
             }
             $3 in required {
               value = $1
+              unit = $2
               gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
-              if (value !~ /^[0-9]+$/ || value == "0") {
+              gsub(/^[[:space:]]+|[[:space:]]+$/, "", unit)
+              if (value !~ /^[0-9]+([.][0-9]+)?$/ || value == "0") {
                 printf "::error::%s was not counted: %s\n", $3, $0
                 exit 1
               }
-              counts[$3] = value + 0
+              counts[$3] = value " " unit
               seen[$3] = 1
             }
             END {
@@ -84,9 +80,71 @@ jobs:
                   exit 1
                 }
               }
-              printf "Perf hardware counters: instructions=%.0f cycles=%.0f IPC=%.3f\n", counts["instructions"], counts["cycles"], counts["instructions"] / counts["cycles"]
+              printf "Perf software counters: task-clock=%s page-faults=%s\n", counts["task-clock"], counts["page-faults"]
             }
           ' perf-stat.csv
+
+      - name: Run instruction and cycle count smoke test
+        run: |
+          set -euo pipefail
+
+          cat > counter-workload.c <<'C'
+          #include <stdint.h>
+          #include <stdio.h>
+
+          static volatile uint64_t sink;
+
+          static uint64_t read_cycles(void) {
+          #if defined(__x86_64__) || defined(__i386__)
+            uint32_t lo;
+            uint32_t hi;
+            __asm__ __volatile__("lfence\nrdtsc" : "=a"(lo), "=d"(hi) :: "memory");
+            return ((uint64_t)hi << 32) | lo;
+          #else
+            return 0;
+          #endif
+          }
+
+          int main(void) {
+            uint64_t total = 0;
+            uint64_t start_cycles = read_cycles();
+
+            for (uint64_t i = 1; i <= 5000000; ++i) {
+              total += ((i % 97) * (i % 89)) ^ (total >> 7);
+            }
+
+            uint64_t cycles = read_cycles() - start_cycles;
+            sink = total;
+
+            printf("workload_result=%llu\n", (unsigned long long)sink);
+            printf("tsc_cycles=%llu\n", (unsigned long long)cycles);
+            return 0;
+          }
+          C
+
+          gcc -O2 -g -o counter-workload counter-workload.c
+          ./counter-workload | tee counter-workload.txt
+
+          valgrind \
+            --tool=callgrind \
+            --callgrind-out-file=callgrind.out \
+            --quiet \
+            ./counter-workload > /dev/null
+
+          instructions="$(awk '/^summary:/ { print $2 }' callgrind.out)"
+          cycles="$(awk -F= '/^tsc_cycles=/ { print $2 }' counter-workload.txt)"
+
+          if [ -z "$instructions" ] || [ "$instructions" -le 0 ]; then
+            echo "::error::Callgrind did not report a positive instruction count."
+            exit 1
+          fi
+
+          if [ -z "$cycles" ] || [ "$cycles" -le 0 ]; then
+            echo "::error::The workload did not report a positive TSC cycle count."
+            exit 1
+          fi
+
+          printf "CI counter smoke test: callgrind_instructions=%s tsc_cycles=%s\n" "$instructions" "$cycles"
 
       - name: Run strace smoke test
         run: |
