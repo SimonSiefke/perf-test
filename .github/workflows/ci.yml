@@ -32,7 +32,7 @@ jobs:
           sudo sysctl -w kernel.perf_event_paranoid=-1
           echo "After: kernel.perf_event_paranoid=$(cat /proc/sys/kernel/perf_event_paranoid)"
 
-      - name: Run perf smoke test
+      - name: Run perf counter smoke test
         run: |
           set -euo pipefail
 
@@ -48,12 +48,45 @@ jobs:
 
           "$perf_bin" --version
 
-          "$perf_bin" stat \
-            -e task-clock,context-switches,cpu-migrations,page-faults \
-            -o perf-stat.txt \
-            -- sleep 0.1
+          workload=(
+            python3
+            -c
+            'total = sum((i % 97) * (i % 89) for i in range(1000000)); print(total)'
+          )
 
-          cat perf-stat.txt
+          "$perf_bin" stat \
+            -x, \
+            -e cycles,instructions,task-clock,context-switches,cpu-migrations,page-faults \
+            -o perf-stat.csv \
+            -- "${workload[@]}"
+
+          cat perf-stat.csv
+
+          awk -F, '
+            BEGIN {
+              required["cycles"] = 1
+              required["instructions"] = 1
+            }
+            $3 in required {
+              value = $1
+              gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+              if (value !~ /^[0-9]+$/ || value == "0") {
+                printf "::error::%s was not counted: %s\n", $3, $0
+                exit 1
+              }
+              counts[$3] = value + 0
+              seen[$3] = 1
+            }
+            END {
+              for (event in required) {
+                if (!(event in seen)) {
+                  printf "::error::Missing perf event: %s\n", event
+                  exit 1
+                }
+              }
+              printf "Perf hardware counters: instructions=%.0f cycles=%.0f IPC=%.3f\n", counts["instructions"], counts["cycles"], counts["instructions"] / counts["cycles"]
+            }
+          ' perf-stat.csv
 
       - name: Run strace smoke test
         run: |
